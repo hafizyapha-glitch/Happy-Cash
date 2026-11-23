@@ -77,6 +77,27 @@
     .kpi-label { grid-area: label; font-size: 13px; font-weight: 500; color: var(--text-secondary); margin-bottom: 4px; }
     .kpi-value { grid-area: value; font-size: 24px; font-weight: 700; font-family: 'Inter',sans-serif; color: var(--text); line-height: 1.2; margin-bottom: 4px; }
 
+    /* Week-over-week comparison: main KPI values retain the selected month/year filter. */
+    .wow-headline { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; padding:14px 18px; border:1px solid var(--border); border-radius:12px; background:var(--card); margin:0 0 18px; }
+    .wow-headline strong { font-size:13px; color:var(--text); }
+    .wow-headline span { font-size:12px; color:var(--text-secondary); }
+    .wow-wrap { grid-column:1/-1; padding-top:10px; margin-top:10px; border-top:1px solid var(--border); min-width:0; }
+    .wow-top { display:flex; justify-content:space-between; align-items:center; gap:6px; flex-wrap:wrap; font-size:11px; color:var(--text-secondary); }
+    .wow-delta { display:inline-flex; align-items:center; gap:4px; font-weight:700; font-size:12px; font-variant-numeric:tabular-nums; }
+    .wow-compare-values { font-size:10px; color:var(--muted); margin-top:3px; line-height:1.6; font-variant-numeric:tabular-nums; }
+    .wow-positive { color:#059669; }
+    .wow-negative { color:#DC2626; }
+    .wow-neutral { color:var(--muted); }
+    body.dark-mode .wow-positive { color:#34D399; }
+    body.dark-mode .wow-negative { color:#F87171; }
+    .wow-inline { margin-top:3px; font-size:10px; line-height:1.3; font-weight:600; white-space:nowrap; font-variant-numeric:tabular-nums; }
+    .wow-table-cell { display:flex; flex-direction:column; gap:2px; }
+    .tm-wow { margin-top:3px; font-size:10px; font-weight:600; }
+    .week-filter { display:flex; align-items:center; gap:7px; }
+    .week-filter label { font-size:12px; font-weight:600; color:var(--text-secondary); }
+    .week-filter select { max-width:245px; }
+
+
     .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 24px; }
     .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 24px; box-shadow: var(--shadow-sm); display: flex; flex-direction: column; position: relative;}
     
@@ -199,6 +220,12 @@
       </button>
     </div>
     <div class="filter-row" style="margin: 0;">
+        <div class="week-filter">
+          <label for="filterWeek">WoW</label>
+          <select id="filterWeek" onchange="window.applyFilters()" title="สัปดาห์ที่ต้องการเปรียบเทียบ (จันทร์–อาทิตย์)">
+            <option value="">สัปดาห์ล่าสุดที่มีข้อมูล</option>
+          </select>
+        </div>
       <select id="filterCampaign" onchange="window.applyFilters()">
         <option value="">ทุก Campaign</option>
       </select>
@@ -336,7 +363,7 @@
   <div class="drawer-content">
     <div class="setting-group">
       <div class="setting-label">ปีที่ต้องการวิเคราะห์ (Year)</div>
-      <div class="setting-desc">เลือกปีเพื่อดึงข้อมูลทั้งหมดในปีนั้นๆ (รูปแบบ YYYY-Month-HPC-FB)</div>
+      <div class="setting-desc">เลือกปีเพื่อดึงข้อมูลทั้งหมดในปีนั้นๆ (รูปแบบ YYYY-Month-HPC-FB) · WoW ต้องมีข้อมูลรายวัน (Date) หรือข้อมูลสรุป 7 วัน จันทร์–อาทิตย์ (Reporting starts/ends) ระบบจะไม่กระจายยอดรายเดือนเป็นรายสัปดาห์</div>
       <select id="settingYear" style="width: 100%;" onchange="window.autoLoadAllMonths()">
         <option value="2024">2024</option>
         <option value="2025">2025</option>
@@ -349,7 +376,8 @@
 
 <script>
 let allData = [];
-let filteredData = []; 
+let filteredData = [];
+let wowPeriod = null; // { current, previous, currentCount, previousCount } (ISO Monday keys)
 
 // 1. ตัวแปรสำหรับเก็บข้อมูลข้อเสนอแนะทั้งหมด
 let suggestionData = []; 
@@ -541,7 +569,9 @@ window.fetchMissingYear = async function(year) {
           reach: parseNum(r['Reach']), 
           impressions: parseNum(r['Impressions']||r['Impr.']),
           message: parseNum(r['Clicks']||r['Link clicks']||r['Clicks (all)']||r['Messaging conversations started']||r['Message']||r['message']),
-          leads: parseNum(r['Leads'] || r['leads'] || r['Results'] || r['Conversions'] || r['Submit lead form'])
+          leads: parseNum(r['Leads'] || r['leads'] || r['Results'] || r['Conversions'] || r['Submit lead form']),
+          engagements: parseNum(r['Post engagements'] ?? r['Engagements'] ?? r['engagements'] ?? 0),
+          weekKey: getRowWeekKey(r)
         };
       }).filter(r => r.campaign && r.campaign !== '-'); 
       
@@ -569,6 +599,7 @@ window.applyFilters = function() {
     return true;
   });
 
+  window.populateWeekOptions();
   window.renderAll();
   window.applySuggestions(); 
 }
@@ -602,10 +633,171 @@ window.renderAll = function() {
   window.renderCampaignTable();
 }
 
-const formatNum = (v) => v.toLocaleString();
-const formatDec = (v) => v.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const formatNum = (v) => (Number.isFinite(v) ? v : 0).toLocaleString('en-US');
+const formatDec = (v) => (Number.isFinite(v) ? v : 0).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 
-function createKPICardWithBench(icon, label, subtitle, value, color, benchmark = '') {
+// Report date parsing only accepts provable daily or Monday-to-Sunday weekly records.
+// A monthly aggregate must NOT be divided by four/five to invent weekly results.
+const ISO_DAY_MS = 86400000;
+const MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+function toIsoDay(d) { return d.toISOString().slice(0, 10); }
+function parseReportDay(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (value instanceof Date && !isNaN(value.getTime())) return toIsoDay(new Date(Date.UTC(value.getFullYear(), value.getMonth(), value.getDate())));
+  if (typeof value === 'number' && Number.isFinite(value) && value > 15000 && value < 100000) {
+    return toIsoDay(new Date(Date.UTC(1899, 11, 30) + Math.floor(value) * ISO_DAY_MS));
+  }
+  const text = String(value).trim();
+  let match = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T].*)?$/);
+  if (match) return validIsoParts(+match[1], +match[2], +match[3]);
+  match = text.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (match) {
+    const a = +match[1], b = +match[2];
+    // Unambiguous US or day-first dates; ambiguous dates default to Meta's US format.
+    return a > 12 ? validIsoParts(+match[3], b, a) : validIsoParts(+match[3], a, b);
+  }
+  return null;
+}
+function validIsoParts(year, month, day) {
+  const d = new Date(Date.UTC(year, month - 1, day));
+  return d.getUTCFullYear() === year && d.getUTCMonth() === month - 1 && d.getUTCDate() === day ? toIsoDay(d) : null;
+}
+function getMonday(isoDay) {
+  const d = new Date(isoDay + 'T00:00:00Z');
+  const dow = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - dow);
+  return toIsoDay(d);
+}
+function addDays(isoDay, days) {
+  return toIsoDay(new Date(Date.parse(isoDay + 'T00:00:00Z') + days * ISO_DAY_MS));
+}
+function getRowWeekKey(row) {
+  // Date/Day means a dated daily observation, irrespective of the report wrapper.
+  const daily = parseReportDay(row['Date'] ?? row['date'] ?? row['Day'] ?? row['day'] ?? row['Report date'] ?? row['Report Date']);
+  if (daily) return getMonday(daily);
+  const statedWeek = parseReportDay(row['Week starting'] ?? row['Week start'] ?? row['Week Start']);
+  if (statedWeek && statedWeek === getMonday(statedWeek)) return statedWeek;
+  const start = parseReportDay(row['Reporting starts'] ?? row['Reporting start'] ?? row['Date start'] ?? row['date_start'] ?? row['Start date']);
+  const end = parseReportDay(row['Reporting ends'] ?? row['Reporting end'] ?? row['Date stop'] ?? row['date_stop'] ?? row['End date']);
+  if (start && end) {
+    if (start === end) return getMonday(start);
+    if (getMonday(start) === start && addDays(start, 6) === end) return start;
+  }
+  return null;
+}
+function weekLabel(monday) {
+  if (!monday) return '—';
+  const sunday = addDays(monday, 6);
+  const concise = (str) => { const [year,month,day] = str.split('-'); return `${+day}/${+month}/${year}`; };
+  return `${concise(monday)} – ${concise(sunday)}`;
+}
+function getWowScopeRows() {
+  const year = +(document.getElementById('settingYear')?.value || new Date().getFullYear());
+  const campaign = document.getElementById('filterCampaign')?.value || '';
+  const platform = document.getElementById('filterPlatform')?.value || '';
+  return allData.filter(r => r.year === year && r.weekKey && (!campaign || r.campaign === campaign) && (!platform || r.platform === platform));
+}
+window.populateWeekOptions = function() {
+  const selector = document.getElementById('filterWeek');
+  if (!selector) return;
+  const existingValue = selector.value;
+  const month = document.getElementById('filterMonth')?.value || '';
+  const today = new Date();
+  const thisMonday = getMonday(validIsoParts(today.getFullYear(), today.getMonth() + 1, today.getDate()));
+  const eligible = getWowScopeRows().filter(r => r.weekKey < thisMonday &&
+    (!month || (MONTH_NAMES[+r.weekKey.slice(5,7)-1] === month || MONTH_NAMES[+addDays(r.weekKey,6).slice(5,7)-1] === month)));
+  const weeks = [...new Set(eligible.map(r => r.weekKey))].sort().reverse();
+  selector.innerHTML = '<option value="">สัปดาห์ล่าสุดที่มีข้อมูล</option>' +
+    weeks.map(key => `<option value="${key}">${weekLabel(key)}</option>`).join('');
+  if (weeks.includes(existingValue)) selector.value = existingValue;
+  else selector.value = '';
+  const current = selector.value || weeks[0] || null;
+  const previous = current ? addDays(current, -7) : null;
+  const scope = getWowScopeRows();
+  wowPeriod = current ? {
+    current, previous,
+    currentCount: scope.filter(r => r.weekKey === current).length,
+    previousCount: scope.filter(r => r.weekKey === previous).length
+  } : null;
+};
+function getWoWData(dataSet = null) {
+  if (!wowPeriod) return { current: [], previous: [] };
+  const rows = dataSet || getWowScopeRows();
+  return {
+    current: rows.filter(r => r.weekKey === wowPeriod.current),
+    previous: rows.filter(r => r.weekKey === wowPeriod.previous)
+  };
+}
+function metricSummary(rows) {
+  const sum = key => rows.reduce((total, row) => total + (Number(row[key]) || 0), 0);
+  const spend = sum('spend'), reach = sum('reach'), impr = sum('impressions');
+  const message = sum('message'), leads = sum('leads'), engagements = sum('engagements');
+  const divide = (numerator, denominator) => denominator > 0 ? numerator / denominator : null;
+  return {
+    spend, reach, impr, impressions: impr, message, leads, engagements,
+    freq: divide(impr, reach), cpr: divide(spend * 1000, reach),
+    cpm: divide(spend * 1000, impr), cpmsg: divide(spend, message),
+    cpl: divide(spend, leads), ctr: divide(message * 100, impr),
+    cpe: divide(spend, engagements)
+  };
+}
+const COST_METRICS = new Set(['cpr','cpm','cpmsg','cpl','cpe']);
+const NEUTRAL_METRICS = new Set(['spend','freq']);
+function fmtWoWMetric(metric, value) {
+  if (value === null || !Number.isFinite(value)) return '—';
+  if (COST_METRICS.has(metric) || metric === 'spend') return '฿' + formatDec(value);
+  if (metric === 'ctr') return formatDec(value) + '%';
+  if (metric === 'freq') return value.toFixed(2);
+  return formatNum(value);
+}
+function getWoWComparison(metric, currentRows, previousRows) {
+  // Week pair must exist in the original data. Do not silently report a missing week as zero.
+  if (!wowPeriod || wowPeriod.currentCount === 0 || wowPeriod.previousCount === 0)
+    return { available:false, reason: 'ข้อมูลรายสัปดาห์ไม่ครบสำหรับเปรียบเทียบ' };
+  if (!currentRows.length && !previousRows.length)
+    return { available:false, reason:'ไม่มีข้อมูลของรายการในทั้งสองสัปดาห์' };
+  const current = metricSummary(currentRows)[metric];
+  const previous = metricSummary(previousRows)[metric];
+  if (current === null || previous === null || !Number.isFinite(current) || !Number.isFinite(previous))
+    return { available:false, reason:'คำนวณอัตราไม่ได้เนื่องจากตัวหารเป็นศูนย์' };
+  const delta = current - previous;
+  const pct = previous !== 0 ? (delta / Math.abs(previous) * 100) : (current === 0 ? 0 : null);
+  const newValue = previous === 0 && current > 0;
+  const trend = delta > 0 ? 1 : delta < 0 ? -1 : 0;
+  const colorClass = trend === 0 || NEUTRAL_METRICS.has(metric) ? 'wow-neutral'
+    : (COST_METRICS.has(metric) ? trend < 0 : trend > 0) ? 'wow-positive' : 'wow-negative';
+  const trendText = trend > 0 ? '▲' : trend < 0 ? '▼' : '●';
+  return { available:true, current, previous, pct, newValue, trend, colorClass, trendText };
+}
+function wowShortText(comparison) {
+  if (!comparison.available) return 'WoW —';
+  if (comparison.newValue) return 'WoW ใหม่';
+  const sign = comparison.pct > 0 ? '+' : '';
+  return `${comparison.trendText} ${sign}${comparison.pct.toFixed(1)}% WoW`;
+}
+function wowInline(metric, currentRows, previousRows, cssClass='wow-inline') {
+  const result = getWoWComparison(metric, currentRows, previousRows);
+  const text = wowShortText(result);
+  return `<div class="${cssClass} ${result.available ? result.colorClass : 'wow-neutral'}" title="${result.reason || ('สัปดาห์ '+weekLabel(wowPeriod.current)+' เทียบกับ '+weekLabel(wowPeriod.previous))}">${text}</div>`;
+}
+function wowCard(metric, currentRows, previousRows) {
+  const result = getWoWComparison(metric, currentRows, previousRows);
+  if (!result.available) return `<div class="wow-wrap" title="${result.reason}"><div class="wow-top"><span>Week on Week</span><span class="wow-delta wow-neutral">— N/A</span></div><div class="wow-compare-values">${result.reason}</div></div>`;
+  return `<div class="wow-wrap"><div class="wow-top"><span>Week on Week</span><span class="wow-delta ${result.colorClass}">${wowShortText(result)}</span></div>
+    <div class="wow-compare-values">สัปดาห์ที่เลือก ${fmtWoWMetric(metric, result.current)} · ก่อนหน้า ${fmtWoWMetric(metric, result.previous)}</div></div>`;
+}
+function wowTableCell(metric, text, currentRows, previousRows) {
+  return `<div class="wow-table-cell"><span>${text}</span>${wowInline(metric, currentRows, previousRows)}</div>`;
+}
+function wowHeadline() {
+  if (!wowPeriod) return `<div class="wow-headline"><strong>Week on Week Comparison</strong><span>ไม่มีวันที่รายวัน/สัปดาห์ที่ใช้เปรียบเทียบได้ · ต้องมีคอลัมน์ Date หรือ Reporting starts/ends ที่ระบุช่วงรายสัปดาห์</span></div>`;
+  const comparison = wowPeriod.previousCount > 0 ?
+    `WoW: ${weekLabel(wowPeriod.current)} เทียบ ${weekLabel(wowPeriod.previous)}` :
+    `ยังไม่มีข้อมูลสัปดาห์ก่อนหน้า (${weekLabel(wowPeriod.previous)})`;
+  return `<div class="wow-headline"><strong>Week on Week Comparison</strong><span>${comparison} · ตัวเลข KPI ใหญ่ยังเป็นยอดรวมตามตัวกรอง · Reach เป็นผลรวมจากแถวรายงาน อาจไม่ใช่ยอด Unique ของทั้งสัปดาห์</span></div>`;
+}
+
+function createKPICardWithBench(icon, label, subtitle, value, color, benchmark = '', wowHtml = '') {
     let benchHtml = '';
     if (benchmark) {
         benchHtml = `
@@ -620,6 +812,7 @@ function createKPICardWithBench(icon, label, subtitle, value, color, benchmark =
       <div class="kpi-icon" style="color:${color};background:color-mix(in srgb,${color} 12%,transparent);">${icon}</div>
       <div class="kpi-value">${value}</div>
       ${subtitle ? `<div class="kpi-sub" style="grid-column: 1/-1; font-size:12px; color:var(--muted); margin-top:-4px; margin-bottom:12px;">${subtitle}</div>` : ''}
+      ${wowHtml}
       ${benchHtml}
       </div>`;
 }
@@ -660,26 +853,30 @@ window.renderKPIs = function() {
       specificFbData = fbData.filter(r => r.campaign === currentFbCampaignFilter);
   }
   const fb = getMetrics(specificFbData);
+  const comparisonScope = getWoWData();
+  const fbComparisonScope = getWoWData(getWowScopeRows().filter(r => r.platform === 'Facebook' && (!currentFbCampaignFilter || r.campaign === currentFbCampaignFilter)));
+  const ovWoW = key => wowCard(key, comparisonScope.current, comparisonScope.previous);
+  const fbWoW = key => wowCard(key, fbComparisonScope.current, fbComparisonScope.previous);
 
-  let html = '';
+  let html = wowHeadline();
 
   html += `
     <div class="kpi-section-title">Overview</div>
     <div class="kpi-group-label">Performance</div>
     <div class="kpi-grid row3">
-      ${createKPICardWithBench(iconSpend, 'Total Spend', '', '฿'+formatDec(o.spend), 'var(--primary)')}
-      ${createKPICardWithBench(iconReach, 'Reach', '', formatNum(o.reach), 'var(--green)')}
-      ${createKPICardWithBench(iconImpr, 'Impressions', '', formatNum(o.impr), 'var(--blue)')}
-      ${createKPICardWithBench(iconMessage, 'Message', '', formatNum(o.message), 'var(--accent)')}
-      ${createKPICardWithBench(iconLead, 'Leads', '', formatNum(o.leads), '#06B6D4')}
-      ${createKPICardWithBench(iconFreq, 'Frequency', '', o.freq.toFixed(2), '#8B5CF6')}
+      ${createKPICardWithBench(iconSpend, 'Total Spend', '', '฿'+formatDec(o.spend), 'var(--primary)', '', ovWoW('spend'))}
+      ${createKPICardWithBench(iconReach, 'Reach', '', formatNum(o.reach), 'var(--green)', '', ovWoW('reach'))}
+      ${createKPICardWithBench(iconImpr, 'Impressions', '', formatNum(o.impr), 'var(--blue)', '', ovWoW('impr'))}
+      ${createKPICardWithBench(iconMessage, 'Message', '', formatNum(o.message), 'var(--accent)', '', ovWoW('message'))}
+      ${createKPICardWithBench(iconLead, 'Leads', '', formatNum(o.leads), '#06B6D4', '', ovWoW('leads'))}
+      ${createKPICardWithBench(iconFreq, 'Frequency', '', o.freq.toFixed(2), '#8B5CF6', '', ovWoW('freq'))}
     </div>
     <div class="kpi-group-label">Cost Efficiency</div>
     <div class="kpi-grid row4">
-      ${createKPICardWithBench(iconCost, 'Cost per 1,000 Reach (CPR)', 'Cost per 1,000 reach', '฿'+formatDec(o.cpr), 'var(--green)', '฿80-฿150')}
-      ${createKPICardWithBench(iconCost, 'CPM', 'Cost per 1,000 impressions', '฿'+formatDec(o.cpm), 'var(--primary)', '฿50-฿150')}
-      ${createKPICardWithBench(iconCost, 'CPMsg', 'Cost per message', '฿'+formatDec(o.cpmsg), 'var(--accent)', '฿30-฿150')}
-      ${createKPICardWithBench(iconCost, 'Cost per Lead (CPL)', 'Cost per submitted lead form', '฿'+formatDec(o.cpl), '#06B6D4', '฿150-฿500')}
+      ${createKPICardWithBench(iconCost, 'Cost per 1,000 Reach (CPR)', 'Cost per 1,000 reach', '฿'+formatDec(o.cpr), 'var(--green)', '฿80-฿150', ovWoW('cpr'))}
+      ${createKPICardWithBench(iconCost, 'CPM', 'Cost per 1,000 impressions', '฿'+formatDec(o.cpm), 'var(--primary)', '฿50-฿150', ovWoW('cpm'))}
+      ${createKPICardWithBench(iconCost, 'CPMsg', 'Cost per message', '฿'+formatDec(o.cpmsg), 'var(--accent)', '฿30-฿150', ovWoW('cpmsg'))}
+      ${createKPICardWithBench(iconCost, 'Cost per Lead (CPL)', 'Cost per submitted lead form', '฿'+formatDec(o.cpl), '#06B6D4', '฿150-฿500', ovWoW('cpl'))}
     </div>
     <div style="text-align: right; font-size: 11px; color: var(--muted); margin-top: -8px; margin-bottom: 24px;">Benchmark ref: Industry Average (Thailand)</div>
   `;
@@ -694,19 +891,19 @@ window.renderKPIs = function() {
     </div>
     <div class="kpi-group-label">Performance</div>
     <div class="kpi-grid row3">
-      ${createKPICardWithBench(iconSpend, 'Total Spend', '', '฿'+formatDec(fb.spend), '#1877F2')}
-      ${createKPICardWithBench(iconReach, 'Reach', '', formatNum(fb.reach), 'var(--green)')}
-      ${createKPICardWithBench(iconImpr, 'Impressions', '', formatNum(fb.impr), 'var(--blue)')}
-      ${createKPICardWithBench(iconMessage, 'Message', '', formatNum(fb.message), 'var(--accent)')}
-      ${createKPICardWithBench(iconLead, 'Leads', '', formatNum(fb.leads), '#06B6D4')}
-      ${createKPICardWithBench(iconFreq, 'Frequency', '', fb.freq.toFixed(2), '#8B5CF6')}
+      ${createKPICardWithBench(iconSpend, 'Total Spend', '', '฿'+formatDec(fb.spend), '#1877F2', '', fbWoW('spend'))}
+      ${createKPICardWithBench(iconReach, 'Reach', '', formatNum(fb.reach), 'var(--green)', '', fbWoW('reach'))}
+      ${createKPICardWithBench(iconImpr, 'Impressions', '', formatNum(fb.impr), 'var(--blue)', '', fbWoW('impr'))}
+      ${createKPICardWithBench(iconMessage, 'Message', '', formatNum(fb.message), 'var(--accent)', '', fbWoW('message'))}
+      ${createKPICardWithBench(iconLead, 'Leads', '', formatNum(fb.leads), '#06B6D4', '', fbWoW('leads'))}
+      ${createKPICardWithBench(iconFreq, 'Frequency', '', fb.freq.toFixed(2), '#8B5CF6', '', fbWoW('freq'))}
     </div>
     <div class="kpi-group-label">Cost Efficiency</div>
     <div class="kpi-grid row4">
-      ${createKPICardWithBench(iconCost, 'Cost per 1,000 Reach (CPR)', 'Cost per 1,000 reach', '฿'+formatDec(fb.cpr), 'var(--green)', '฿80-฿150')}
-      ${createKPICardWithBench(iconCost, 'CPM', 'Cost per 1,000 impressions', '฿'+formatDec(fb.cpm), '#1877F2', '฿50-฿120')}
-      ${createKPICardWithBench(iconCost, 'CPMsg', 'Cost per message', '฿'+formatDec(fb.cpmsg), 'var(--accent)', '฿30-฿150')}
-      ${createKPICardWithBench(iconCost, 'Cost per Lead (CPL)', 'Cost per submitted lead form', '฿'+formatDec(fb.cpl), '#06B6D4', '฿100-฿400')}
+      ${createKPICardWithBench(iconCost, 'Cost per 1,000 Reach (CPR)', 'Cost per 1,000 reach', '฿'+formatDec(fb.cpr), 'var(--green)', '฿80-฿150', fbWoW('cpr'))}
+      ${createKPICardWithBench(iconCost, 'CPM', 'Cost per 1,000 impressions', '฿'+formatDec(fb.cpm), '#1877F2', '฿50-฿120', fbWoW('cpm'))}
+      ${createKPICardWithBench(iconCost, 'CPMsg', 'Cost per message', '฿'+formatDec(fb.cpmsg), 'var(--accent)', '฿30-฿150', fbWoW('cpmsg'))}
+      ${createKPICardWithBench(iconCost, 'Cost per Lead (CPL)', 'Cost per submitted lead form', '฿'+formatDec(fb.cpl), '#06B6D4', '฿100-฿400', fbWoW('cpl'))}
     </div>
     <div style="text-align: right; font-size: 11px; color: var(--muted); margin-top: -8px; margin-bottom: 24px;">Benchmark ref: Meta Business Suite / Wordstream Facebook Ads (Thailand)</div>
   `;
@@ -761,6 +958,7 @@ window.renderKPIs = function() {
      topFbAds.forEach((ad, index) => {
        let cpm = ad.impressions > 0 ? (ad.spend/ad.impressions)*1000 : 0;
        let cpmsg = ad.message > 0 ? ad.spend/ad.message : 0;
+       const adRows = getWoWData(getWowScopeRows().filter(r => r.platform === 'Facebook' && r.ad === ad.ad && (!currentFbCampaignFilter || r.campaign === currentFbCampaignFilter)));
        let jpgPath = `./data/facebook/image/${ad.ad}.jpg`;
        let pngPath = `./data/facebook/image/${ad.ad}.png`;
        let displayPath = `./data/facebook/image/${ad.ad}.[jpg/png]`;
@@ -787,29 +985,29 @@ window.renderKPIs = function() {
                  <div style="display:grid; grid-template-columns:1fr 1fr; row-gap:12px; font-size:13px;">
                     <div>
                       <div style="font-size:11px; color:var(--text-secondary); margin-bottom:2px;">Spend</div>
-                      <div style="font-weight:700; color:#2563EB;">฿${formatNum(Math.round(ad.spend))}</div>
+                      <div style="font-weight:700; color:#2563EB;">฿${formatNum(Math.round(ad.spend))}</div>${wowInline('spend', adRows.current, adRows.previous)}
                     </div>
                     <div>
                       <div style="font-size:11px; color:var(--text-secondary); margin-bottom:2px;">Reach</div>
-                      <div style="font-weight:700; color:var(--text);">${formatNum(ad.reach)}</div>
+                      <div style="font-weight:700; color:var(--text);">${formatNum(ad.reach)}</div>${wowInline('reach', adRows.current, adRows.previous)}
                     </div>
                     
                     <div>
                       <div style="font-size:11px; color:var(--text-secondary); margin-bottom:2px;">Impressions</div>
-                      <div style="font-weight:700; color:var(--text);">${formatNum(ad.impressions)}</div>
+                      <div style="font-weight:700; color:var(--text);">${formatNum(ad.impressions)}</div>${wowInline('impr', adRows.current, adRows.previous)}
                     </div>
                     <div>
                       <div style="font-size:11px; color:var(--text-secondary); margin-bottom:2px;">Message</div>
-                      <div style="font-weight:700; color:var(--text);">${formatNum(ad.message)}</div>
+                      <div style="font-weight:700; color:var(--text);">${formatNum(ad.message)}</div>${wowInline('message', adRows.current, adRows.previous)}
                     </div>
                     
                     <div>
                       <div style="font-size:11px; color:var(--text-secondary); margin-bottom:2px;">CPM</div>
-                      <div style="font-weight:700; color:var(--text);">฿${formatDec(cpm)}</div>
+                      <div style="font-weight:700; color:var(--text);">฿${formatDec(cpm)}</div>${wowInline('cpm', adRows.current, adRows.previous)}
                     </div>
                     <div>
                       <div style="font-size:11px; color:var(--text-secondary); margin-bottom:2px;">CPMsg</div>
-                      <div style="font-weight:700; color:var(--text);">฿${formatDec(cpmsg)}</div>
+                      <div style="font-weight:700; color:var(--text);">฿${formatDec(cpmsg)}</div>${wowInline('cpmsg', adRows.current, adRows.previous)}
                     </div>
                  </div>
              </div>
@@ -837,32 +1035,27 @@ window.renderTopAdsMetrics = function() {
   const adMetricGroups = {};
   d.forEach(r => { if (r.ad) adMetricGroups[r.ad] = (adMetricGroups[r.ad] || 0) + r.reach; });
   const sortedAdMetric = Object.entries(adMetricGroups).sort((a,b)=>b[1]-a[1]);
-
   const container = document.getElementById('topAdMetricsContainer');
-  
-  if (sortedAdMetric.length > 0) {
-    const topAdName = sortedAdMetric[0][0];
-    let tSpend=0, tReach=0, tImpr=0, tMessage=0, tLead=0, tEng=0;
-    d.filter(r => r.ad === topAdName).forEach(r => { 
-      tSpend+=r.spend; tReach+=r.reach; tImpr+=r.impressions; 
-      tMessage+=r.message; tLead+=r.leads; tEng+=r.engagements; 
-    });
-
-    container.innerHTML = `
-      <div class="top-metric-item"><div class="tm-label">Ad Name</div><div class="tm-val" style="font-size:13px;word-break:break-all;color:var(--primary);">${topAdName}</div></div>
-      <div class="top-metric-item"><div class="tm-label">Spending</div><div class="tm-val">฿${formatDec(tSpend)}</div></div>
-      <div class="top-metric-item"><div class="tm-label">Reach</div><div class="tm-val">${formatNum(tReach)}</div></div>
-      <div class="top-metric-item"><div class="tm-label">Impressions</div><div class="tm-val">${formatNum(tImpr)}</div></div>
-      <div class="top-metric-item"><div class="tm-label">Message</div><div class="tm-val">${formatNum(tMessage)}</div></div>
-      <div class="top-metric-item"><div class="tm-label">Leads</div><div class="tm-val">${formatNum(tLead)}</div></div>
-      <div class="top-metric-item"><div class="tm-label">Engagements</div><div class="tm-val">${formatNum(tEng)}</div></div>
-      <div class="top-metric-item"><div class="tm-label">CPM</div><div class="tm-val">฿${tImpr>0?formatDec((tSpend/tImpr)*1000):'0.00'}</div></div>
-      <div class="top-metric-item"><div class="tm-label">CPE</div><div class="tm-val">฿${tEng>0?formatDec(tSpend/tEng):'0.00'}</div></div>
-      <div class="top-metric-item"><div class="tm-label">CPMsg</div><div class="tm-val">฿${tMessage>0?formatDec(tSpend/tMessage):'0.00'}</div></div>
-      <div class="top-metric-item"><div class="tm-label">CPL</div><div class="tm-val">฿${tLead>0?formatDec(tSpend/tLead):'0.00'}</div></div>`;
-  } else {
-    container.innerHTML = ``;
-  }
+  if (!sortedAdMetric.length) { container.innerHTML = ''; return; }
+  const adName = sortedAdMetric[0][0];
+  const totals = metricSummary(d.filter(r => r.ad === adName));
+  const dataWoW = getWoWData(getWowScopeRows().filter(r => r.ad === adName));
+  const item = (label, metric, value) => `<div class="top-metric-item"><div class="tm-label">${label}</div><div class="tm-val">${value}</div>${wowInline(metric, dataWoW.current, dataWoW.previous, 'tm-wow')}</div>`;
+  container.innerHTML = `
+    <div class="top-metric-item"><div class="tm-label">Ad Name</div><div class="tm-val" style="font-size:13px;word-break:break-all;color:var(--primary);">${escapeHtml(adName)}</div></div>
+    ${item('Spending','spend',fmtWoWMetric('spend',totals.spend))}
+    ${item('Reach','reach',fmtWoWMetric('reach',totals.reach))}
+    ${item('Impressions','impr',fmtWoWMetric('impr',totals.impr))}
+    ${item('Message','message',fmtWoWMetric('message',totals.message))}
+    ${item('Leads','leads',fmtWoWMetric('leads',totals.leads))}
+    ${item('Engagements','engagements',fmtWoWMetric('engagements',totals.engagements))}
+    ${item('CPM','cpm',fmtWoWMetric('cpm',totals.cpm))}
+    ${item('CPE','cpe',fmtWoWMetric('cpe',totals.cpe))}
+    ${item('CPMsg','cpmsg',fmtWoWMetric('cpmsg',totals.cpmsg))}
+    ${item('CPL','cpl',fmtWoWMetric('cpl',totals.cpl))}`;
+};
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 let currentSortCol = 'spend', currentSortAsc = false;
@@ -899,20 +1092,22 @@ window.renderTable = function() {
   });
 
   document.getElementById('tableCount').textContent = `แสดง ${groupedData.length} รายการ`;
+  const adWeeklyRows = getWowScopeRows();
   document.getElementById('tableBody').innerHTML = groupedData.map(r=>{
+    const w = getWoWData(adWeeklyRows.filter(row => row.ad === r.ad && row.platform === r.platform));
     const pColor = r.platform === 'Facebook' ? '#1877F2' : '#EA4335';
     return `<tr>
       <td title="${r.ad}" style="max-width:240px; overflow:hidden; text-overflow:ellipsis;"><span>${r.ad}</span></td>
       <td><span style="color:${pColor}; font-weight:600;">${r.platform}</span></td>
-      <td class="cost-cell">฿${formatDec(r.spend)}</td>
-      <td class="num">${formatNum(r.reach)}</td>
-      <td class="num">${formatNum(r.impressions)}</td>
-      <td class="num">${formatNum(r.message)}</td>
-      <td class="num">${formatNum(r.leads)}</td>
-      <td class="cost-cell">฿${formatDec(r.cpm)}</td>
-      <td class="cost-cell">฿${formatDec(r.cpmsg)}</td>
-      <td class="cost-cell">฿${formatDec(r.cpl)}</td>
-      <td class="num text-blue">${formatDec(r.ctr)}%</td>
+      <td class="cost-cell">${wowTableCell('spend', `฿${formatDec(r.spend)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('reach', `${formatNum(r.reach)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('impr', `${formatNum(r.impressions)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('message', `${formatNum(r.message)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('leads', `${formatNum(r.leads)}`, w.current, w.previous)}</td>
+      <td class="cost-cell">${wowTableCell('cpm', `฿${formatDec(r.cpm)}`, w.current, w.previous)}</td>
+      <td class="cost-cell">${wowTableCell('cpmsg', `฿${formatDec(r.cpmsg)}`, w.current, w.previous)}</td>
+      <td class="cost-cell">${wowTableCell('cpl', `฿${formatDec(r.cpl)}`, w.current, w.previous)}</td>
+      <td class="num text-blue">${wowTableCell('ctr', `${formatDec(r.ctr)}%`, w.current, w.previous)}</td>
     </tr>`;
   }).join('');
 }
@@ -952,20 +1147,22 @@ window.renderCampaignTable = function() {
   });
 
   document.getElementById('tableCountCamp').textContent = `แสดง ${groupedData.length} รายการ`;
+  const campaignWeeklyRows = getWowScopeRows();
   document.getElementById('tableBodyCamp').innerHTML = groupedData.map(r=>{
+    const w = getWoWData(campaignWeeklyRows.filter(row => row.campaign === r.campaign && row.platform === r.platform));
     const pColor = r.platform === 'Facebook' ? '#1877F2' : '#EA4335';
     return `<tr>
       <td title="${r.campaign}" style="max-width:240px; overflow:hidden; text-overflow:ellipsis;"><span>${r.campaign}</span></td>
       <td><span style="color:${pColor}; font-weight:600;">${r.platform}</span></td>
-      <td class="cost-cell">฿${formatDec(r.spend)}</td>
-      <td class="num">${formatNum(r.reach)}</td>
-      <td class="num">${formatNum(r.impressions)}</td>
-      <td class="num">${formatNum(r.message)}</td>
-      <td class="num">${formatNum(r.leads)}</td>
-      <td class="cost-cell">฿${formatDec(r.cpm)}</td>
-      <td class="cost-cell">฿${formatDec(r.cpmsg)}</td>
-      <td class="cost-cell">฿${formatDec(r.cpl)}</td>
-      <td class="num text-blue">${formatDec(r.ctr)}%</td>
+      <td class="cost-cell">${wowTableCell('spend', `฿${formatDec(r.spend)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('reach', `${formatNum(r.reach)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('impr', `${formatNum(r.impressions)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('message', `${formatNum(r.message)}`, w.current, w.previous)}</td>
+      <td class="num">${wowTableCell('leads', `${formatNum(r.leads)}`, w.current, w.previous)}</td>
+      <td class="cost-cell">${wowTableCell('cpm', `฿${formatDec(r.cpm)}`, w.current, w.previous)}</td>
+      <td class="cost-cell">${wowTableCell('cpmsg', `฿${formatDec(r.cpmsg)}`, w.current, w.previous)}</td>
+      <td class="cost-cell">${wowTableCell('cpl', `฿${formatDec(r.cpl)}`, w.current, w.previous)}</td>
+      <td class="num text-blue">${wowTableCell('ctr', `${formatDec(r.ctr)}%`, w.current, w.previous)}</td>
     </tr>`;
   }).join('');
 }
