@@ -178,6 +178,19 @@
     @media (max-width: 600px) {
       .kpi-grid.row4, .kpi-grid.row3 { grid-template-columns: 1fr; }
     }
+
+    .image-controls { display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 16px; }
+    .image-control-btn { border-radius:8px;padding:8px 10px;font-size:12px;font-family:inherit; }
+    .image-controls-hint {font-size:11px;color:var(--muted);}
+    .image-library-panel {background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:12px;margin:0 0 16px;display:flex;flex-direction:column;gap:8px;}
+    .image-library-list {max-height:180px;overflow-y:auto;font-family:monospace;font-size:12px;border-radius:6px;}
+    .image-library-row {padding:5px 8px;overflow-wrap:anywhere;border-bottom:1px solid var(--border);}
+    .image-library-row:last-child {border-bottom:0;}
+    .image-match-label {font-size:10px;color:var(--muted);min-height:16px;overflow-wrap:anywhere;}
+    .image-picker {margin-top:8px;color:var(--muted);font-size:11px;border-top:1px dashed var(--border);padding-top:8px;}
+    .image-picker summary {cursor:pointer;color:var(--text-secondary);font-weight:600;}
+    .image-filename {font-family:monospace;overflow-wrap:anywhere;padding:6px;background:var(--surface);border-radius:5px;margin-top:5px;max-height:80px;overflow-y:auto;}
+
   </style>
 </head>
 <body>
@@ -228,7 +241,13 @@
             <option value="">สัปดาห์ล่าสุดที่มีข้อมูล</option>
           </select>
         </div>
-      <select id="filterCampaign" onchange="window.applyFilters()">
+      <select id="filterObjective" onchange="window.applyFilters()" title="กรองตาม Objective โดยตรวจจากชื่อ Campaign">
+        <option value="">ทุก Objective</option>
+        <option value="lead_gen">Leads Gen</option>
+        <option value="message">Message</option>
+        <option value="awareness">Awareness</option>
+      </select>
+      <select id="filterCampaign" onchange="window.applyFilters()" title="Campaign ใน Objective ที่เลือก">
         <option value="">ทุก Campaign</option>
       </select>
       <select id="filterPlatform" onchange="window.applyFilters()">
@@ -381,6 +400,176 @@ let allData = [];
 let filteredData = [];
 let wowPeriod = null; // { current, previous, currentCount, previousCount } (ISO Monday keys)
 
+
+// Image library: a static web server cannot list image/ files unless a manifest is supplied.
+// Accept a generated manifest.json or a folder chosen locally in the browser.
+let imageFileRecords = [];
+let imageMatchMode = 'smart';
+let imageFilePanelOpen = false;
+let imageFileSearch = '';
+let imageOverrides = {};
+try { imageOverrides = JSON.parse(localStorage.getItem('hpc-gallery-image-overrides-v1') || '{}') || {}; } catch (_) {}
+const GALLERY_IMG_DIR = './data/facebook/image/';
+const IMAGE_EXTENSIONS = /\.(?:png|jpe?g|webp|gif|avif)$/i;
+const IMG_COMMON_WORDS = new Set(['happy','cash','hpc','ad','ads','facebook','fb','creative','image','img','photo','picture','content','campaign','new','final','copy','post','banner','the','and','for','opening','awareness','lead','leads','gen','leadgen','generation','message','messages','marketing','v1','v2','v3']);
+const escapeImageHTML = str => String(str ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function normalizeImageName(value) {
+  return String(value ?? '').replace(/\.(?:png|jpe?g|webp|gif|avif)$/i,'').normalize('NFKC').toLocaleLowerCase()
+    .replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ');
+}
+function importantImageTokens(name) {
+  return normalizeImageName(name).split(' ').filter(t => t.length >= 2 && !IMG_COMMON_WORDS.has(t));
+}
+function safeImageFileName(value) {
+  const str = String(value ?? '').replace(/\\/g,'/').replace(/^\/+/, '').trim();
+  const parts = str.split('/');
+  return str && parts.every(p => p && p !== '.' && p !== '..') && IMAGE_EXTENSIONS.test(str) ? str : null;
+}
+function imageUrlFromFileName(fileName) {
+  return GALLERY_IMG_DIR + fileName.split('/').map(encodeURIComponent).join('/');
+}
+function imageKeyForAd(ad) { return JSON.stringify([ad.campaign, ad.ad]); }
+function getFullImageFileNames() { return imageFileRecords.map(r => r.name); }
+window.readFullImageFilenames = getFullImageFileNames;
+window.getImageFilenameMatches = function(adName, exactOnly=false) {
+  return imageFileRecords.map(r => ({...r, match: scoreImageMatch(adName, r.name, exactOnly)}))
+    .filter(r => r.match.score > 0).sort((a,b) => b.match.score - a.match.score || a.name.localeCompare(b.name));
+};
+function scoreImageMatch(adName, imageName, exactOnly) {
+  const a = normalizeImageName(adName);
+  const b = normalizeImageName(imageName.split('/').pop());
+  if (!a || !b) return {score:0, kind:''};
+  if (a === b) return {score:10000, kind:'ตรงชื่อเต็ม'};
+  if (exactOnly) return {score:0, kind:''};
+  const aT = importantImageTokens(adName);
+  const bT = importantImageTokens(imageName.split('/').pop());
+  if (!aT.length || !bT.length) return {score:0, kind:''};
+  // Distinct objectives in both names must agree, to avoid false positives.
+  const getObj = s => /\blead\s*gen(?:eration)?\b/.test(s) ? 'lead' : /\bmessages?\b/.test(s) ? 'message' : /\bawareness\b/.test(s) ? 'awareness' : '';
+  const objA = getObj(a), objB = getObj(b);
+  if (objA && objB && objA !== objB) return {score:0, kind:''};
+  const meaningfulA = aT.join(' '), meaningfulB = bT.join(' ');
+  // Prefer the entire distinctive phrase when the artwork filename is only a part of the ad name.
+  if (meaningfulA && meaningfulB && (meaningfulA.includes(meaningfulB) || meaningfulB.includes(meaningfulA)) && Math.min(meaningfulA.length, meaningfulB.length) >= 5) {
+    return {score:5000 + Math.min(1500, Math.min(meaningfulA.length, meaningfulB.length)*30) + (objA && objB ? 250 : 0), kind:'ตรงบางส่วน'};
+  }
+  const overlap = bT.filter(t => aT.includes(t));
+  const tokenLength = overlap.reduce((s,t)=>s+t.length,0);
+  if (overlap.length >= 2 && tokenLength >= 7) {
+    return {score:2000 + Math.round(700*(overlap.length / Math.max(aT.length,bT.length))) + tokenLength + (objA && objB ? 100 : 0), kind:'ตรงคำสำคัญ'};
+  }
+  // One distinctive long token is accepted, but do not accept generic words or tiny substrings.
+  if (overlap.length === 1 && overlap[0].length >= 3 && Math.min(aT.length,bT.length) <= 2) {
+    return {score:1500 + overlap[0].length*15, kind:'ตรงบางส่วน'};
+  }
+  return {score:0,kind:''};
+}
+function resolveImageForAd(ad) {
+  const override = imageOverrides[imageKeyForAd(ad)];
+  if (override) {
+    const file = imageFileRecords.find(r => r.name === override);
+    if (file) return {...file, matchType:'เลือกเอง'};
+  }
+  const matches = window.getImageFilenameMatches(ad.ad, imageMatchMode === 'exact');
+  if (!matches.length) return null;
+  const [best, second] = matches;
+  // Never silently select between equally plausible but differently named creative files.
+  if (second && second.match.score === best.match.score && second.name !== best.name) {
+    return {ambiguous:true, candidates:matches.length};
+  }
+  return {...best, matchType:best.match.kind};
+}
+function cleanImageManifestRows(json) {
+  const rows = Array.isArray(json) ? json : (json?.images || json?.files || []);
+  if (!Array.isArray(rows)) return [];
+  return rows.map(item => typeof item === 'string' ? item : (item?.file ?? item?.name ?? item?.filename ?? ''))
+    .map(safeImageFileName).filter(Boolean);
+}
+function rebuildImageIndex(files, source='manifest') {
+  const merged = new Map(imageFileRecords.map(r => [r.name, r]));
+  for (const entry of files) {
+    const name = safeImageFileName(typeof entry === 'string' ? entry : entry?.name);
+    if (!name) continue;
+    merged.set(name, {name, url:typeof entry === 'string' ? imageUrlFromFileName(name) : (entry.url || imageUrlFromFileName(name)), source});
+  }
+  imageFileRecords = [...merged.values()].sort((a,b)=>a.name.localeCompare(b.name,'th'));
+  if (document.getElementById('kpiSection') && typeof window.renderKPIs === 'function') window.renderKPIs();
+}
+window.loadImageManifest = async function() {
+  for (const name of ['manifest.json','images.json']) {
+    const res = await safeFetch(GALLERY_IMG_DIR + name);
+    if (!res.ok) continue;
+    try {
+      const rows = cleanImageManifestRows(await res.json());
+      if (rows.length) rebuildImageIndex(rows, 'manifest');
+      return;
+    } catch(err) { console.warn('อ่านรายชื่อรูปภาพไม่สำเร็จ:', err); }
+  }
+};
+window.selectImageFolder = function() { document.getElementById('imageFolderInput')?.click(); };
+window.readImageFolder = function(input) {
+  // Object URLs from the user's chosen directory work even when HTML is opened directly.
+  for (const record of imageFileRecords) if (record.source === 'folder') URL.revokeObjectURL(record.url);
+  imageFileRecords = imageFileRecords.filter(r => r.source !== 'folder');
+  const files = Array.from(input.files || []).filter(f => IMAGE_EXTENSIONS.test(f.name));
+  rebuildImageIndex(files.map(f => ({name: (f.webkitRelativePath || f.name).split('/').slice(1).join('/') || f.name, url: URL.createObjectURL(f)})), 'folder');
+  input.value = '';
+};
+window.setImageMatchMode = function(mode) { imageMatchMode = mode === 'exact' ? 'exact' : 'smart'; window.renderKPIs(); };
+window.setAdImageOverride = function(encodedKey, value) {
+  let key;
+  try { key = decodeURIComponent(encodedKey); } catch (_) { return; }
+  if (value) imageOverrides[key] = value; else delete imageOverrides[key];
+  try { localStorage.setItem('hpc-gallery-image-overrides-v1', JSON.stringify(imageOverrides)); } catch (_) {}
+  window.renderKPIs();
+};
+window.toggleImageFileList = function() { imageFilePanelOpen = !imageFilePanelOpen; window.renderKPIs(); };
+window.filterImageFiles = function(input) {
+  imageFileSearch = input.value;
+  renderImageFilePanel();
+};
+function renderImageFilePanel() {
+  const panel = document.getElementById('fullImageFileList');
+  if (!panel) return;
+  const names = getFullImageFileNames().filter(n => normalizeImageName(n).includes(normalizeImageName(imageFileSearch)));
+  panel.innerHTML = names.length ? names.map(n => `<div class="image-library-row" title="${escapeImageHTML(n)}">${escapeImageHTML(n)}</div>`).join('')
+    : `<div style="padding:8px; color:var(--muted);">${imageFileRecords.length ? 'ไม่พบชื่อไฟล์ที่ค้นหา' : 'ยังไม่มีรายการชื่อรูปภาพ — เลือกโฟลเดอร์ หรือสร้าง manifest.json ใน data/facebook/image/'}</div>`;
+}
+function imageControlsHTML() {
+  return `<div class="image-controls">
+    <label for="imageMatchMode" style="font-size:12px;font-weight:600;color:var(--text-secondary);">จับคู่รูปภาพ</label>
+    <select id="imageMatchMode" onchange="window.setImageMatchMode(this.value)" style="max-width:215px;" title="เลือกรูปตามชื่อ Ads">
+      <option value="smart" ${imageMatchMode==='smart'?'selected':''}>อัตโนมัติ (ชื่อบางส่วน)</option>
+      <option value="exact" ${imageMatchMode==='exact'?'selected':''}>ตรงชื่อเต็มเท่านั้น</option>
+    </select>
+    <button class="btn-outline image-control-btn" onclick="window.selectImageFolder()">เลือกโฟลเดอร์รูป</button>
+    <button class="btn-outline image-control-btn" onclick="window.toggleImageFileList()">${imageFilePanelOpen?'ซ่อนชื่อไฟล์เต็ม':'ดูชื่อไฟล์เต็ม'} (${imageFileRecords.length})</button>
+    <span class="image-controls-hint">${imageFileRecords.length ? 'อ่านชื่อไฟล์จริงแล้ว' : 'ยังไม่มีรายการไฟล์ · ใช้ manifest.json หรือเลือกโฟลเดอร์'}</span>
+  </div>
+  ${imageFilePanelOpen ? `<div class="image-library-panel"><div style="font-size:13px;font-weight:700;">ชื่อไฟล์ภาพทั้งหมด (แสดงชื่อเต็มและนามสกุล)</div>
+    <input id="imageFileSearch" type="search" placeholder="ค้นหาชื่อไฟล์..." value="${escapeImageHTML(imageFileSearch)}" oninput="window.filterImageFiles(this)" style="padding:8px;width:100%;max-width:420px;border:1px solid var(--border);border-radius:8px;background:var(--card);color:var(--text);" />
+    <div id="fullImageFileList" class="image-library-list"></div></div>` : ''}`;
+}
+function imagePickerHTML(ad, image) {
+  const key = imageKeyForAd(ad);
+  const saved = imageOverrides[key] || '';
+  const matched = image?.name || '';
+  const optionRows = imageFileRecords.map(r => `<option value="${escapeImageHTML(r.name)}" ${saved===r.name?'selected':''}>${escapeImageHTML(r.name)}</option>`).join('');
+  return `<details class="image-picker"><summary>ชื่อไฟล์เต็ม / เปลี่ยนรูป</summary>
+    <div class="image-filename" title="${escapeImageHTML(matched)}">${matched ? escapeImageHTML(matched) : (image?.ambiguous ? 'มีชื่อคล้ายกันหลายไฟล์ กรุณาเลือกเอง' : 'ยังไม่พบรูปที่ตรงกัน')}</div>
+    <select aria-label="เลือกไฟล์ภาพจริงสำหรับ ${escapeImageHTML(ad.ad)}" onchange="window.setAdImageOverride('${encodeURIComponent(key).replace(/'/g,'%27')}',this.value)" style="width:100%;font-size:11px;margin-top:6px;">
+      <option value="">จับคู่อัตโนมัติ</option>${optionRows}
+    </select></details>`;
+}
+window.onGalleryImageError = function(img) {
+  const list = ['jpg','png','jpeg','webp','gif'];
+  const index = Number(img.dataset.fallbackIndex || 0);
+  if (index < list.length) {
+    img.dataset.fallbackIndex = String(index + 1);
+    img.src = img.dataset.fallbackBase + '.' + list[index];
+  } else img.style.display='none';
+};
+
 // 1. ตัวแปรสำหรับเก็บข้อมูลข้อเสนอแนะทั้งหมด
 let suggestionData = []; 
 let currentFbGallerySort = 'spend'; // ตัวแปรสำหรับเก็บค่าการจัดเรียง Gallery
@@ -437,13 +626,16 @@ window.loadSuggestions = async function() {
 
 // 4. ฟังก์ชันสำหรับคัดกรองข้อความตามเดือนที่เลือก
 window.applySuggestions = function() {
-  if (suggestionData.length === 0) return;
+  // Suggestions are prepared for a whole month, not a filtered objective/campaign.
+  const filteredScope = Boolean(document.getElementById('filterObjective')?.value ||
+    document.getElementById('filterCampaign')?.value || currentFbCampaignFilter);
+  if (suggestionData.length === 0 && !filteredScope) return;
 
   let selectedMonth = document.getElementById('filterMonth').value;
   if (!selectedMonth) selectedMonth = 'Total';
 
   ['1', '2'].forEach(i => {
-    const row = suggestionData.find(r => r.box_id && r.box_id.toString() === i && r.month === selectedMonth);
+    const row = filteredScope ? null : suggestionData.find(r => r.box_id && r.box_id.toString() === i && r.month === selectedMonth);
     
     const titleEl = document.getElementById(`topAdTitle${i}`);
     const subEl = document.getElementById(`topAdSub${i}`);
@@ -494,6 +686,7 @@ window.onload = function() {
   
   window.loadSuggestions();
   window.autoLoadAllMonths();
+  window.loadImageManifest();
 };
 
 window.showStatus = function(msg) {
@@ -618,38 +811,65 @@ window.fetchMissingYear = async function(year) {
   }
 }
 
+// Objective must come from Campaign Name (never from the result columns).
+function getCampaignObjective(campaignName) {
+  const normalized = String(campaignName || '').toLowerCase().replace(/[_\-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (/(?:^| )lead\s*(?:gen|generation)(?: |$)/.test(normalized)) return 'lead_gen';
+  if (/(?:^| )(?:message|messages|messaging)(?: |$)/.test(normalized)) return 'message';
+  if (/(?:^| )awareness(?: |$)/.test(normalized)) return 'awareness';
+  return 'other';
+}
+
 window.applyFilters = function() {
+  // A change in Objective or Year updates the Campaign list before applying any filter.
+  window.populateFilters();
+  const objective = document.getElementById('filterObjective').value;
   const campaign = document.getElementById('filterCampaign').value;
   const platform = document.getElementById('filterPlatform').value;
   const monthFilter = document.getElementById('filterMonth').value;
   const yearSelect = document.getElementById('settingYear');
   const targetYear = yearSelect ? parseInt(yearSelect.value) : new Date().getFullYear();
 
-  if (currentFbCampaignFilter && !allData.some(r => r.campaign === currentFbCampaignFilter && r.year === targetYear)) currentFbCampaignFilter = '';
-
   filteredData = allData.filter(r => {
     if (r.year !== targetYear) return false;
+    if (objective && getCampaignObjective(r.campaign) !== objective) return false;
     if (campaign && r.campaign !== campaign) return false;
     if (platform && r.platform !== platform) return false;
     if (monthFilter && r.month !== monthFilter) return false;
     return true;
   });
 
+  // Clear a stale secondary Facebook Campaign selection that is no longer in this Objective.
+  if (currentFbCampaignFilter && !filteredData.some(r => r.platform === 'Facebook' && r.campaign === currentFbCampaignFilter)) {
+    currentFbCampaignFilter = '';
+  }
+
   window.populateWeekOptions();
   window.renderAll();
-  window.applySuggestions(); 
+  window.applySuggestions();
 }
 
 window.clearFilters = function() {
+  document.getElementById('filterObjective').value = '';
   document.getElementById('filterCampaign').value = '';
   document.getElementById('filterPlatform').value = '';
   document.getElementById('filterMonth').value = '';
+  document.getElementById('filterWeek').value = '';
+  currentFbCampaignFilter = '';
   window.applyFilters();
 }
 
 window.populateFilters = function() {
-  const campaigns = [...new Set(allData.map(r=>r.campaign))].filter(c=>c).sort();
-  document.getElementById('filterCampaign').innerHTML = '<option value="">ทุก Campaign</option>'+campaigns.map(c=>`<option value="${c}">${c}</option>`).join('');
+  const selector = document.getElementById('filterCampaign');
+  if (!selector) return;
+  const previous = selector.value;
+  const year = +(document.getElementById('settingYear')?.value || new Date().getFullYear());
+  const objective = document.getElementById('filterObjective')?.value || '';
+  const campaigns = [...new Set(allData.filter(r => r.year === year &&
+    (!objective || getCampaignObjective(r.campaign) === objective)).map(r => r.campaign))].filter(Boolean).sort();
+  selector.innerHTML = '<option value="">ทุก Campaign</option>' +
+    campaigns.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('');
+  selector.value = campaigns.includes(previous) ? previous : '';
 }
 
 window.handleFbGallerySort = function(val) {
@@ -660,6 +880,7 @@ window.handleFbGallerySort = function(val) {
 window.handleFbCampaignFilter = function(val) {
   currentFbCampaignFilter = val;
   window.renderKPIs(); // Re-render KPI และ Gallery
+  window.applySuggestions();
 }
 
 window.renderAll = function() { 
@@ -729,16 +950,21 @@ function weekLabel(monday) {
 }
 function getWowScopeRows() {
   const year = +(document.getElementById('settingYear')?.value || new Date().getFullYear());
+  const objective = document.getElementById('filterObjective')?.value || '';
   const campaign = document.getElementById('filterCampaign')?.value || '';
   const platform = document.getElementById('filterPlatform')?.value || '';
-  return allData.filter(r => r.year === year && r.weekKey && (!campaign || r.campaign === campaign) && (!platform || r.platform === platform));
+  return allData.filter(r => r.year === year && r.weekKey &&
+    (!objective || getCampaignObjective(r.campaign) === objective) &&
+    (!campaign || r.campaign === campaign) && (!platform || r.platform === platform));
 }
 function getWoWDiagnostic() {
   const year = +(document.getElementById('settingYear')?.value || new Date().getFullYear());
   const month = document.getElementById('filterMonth')?.value || '';
+  const objective = document.getElementById('filterObjective')?.value || '';
   const campaign = document.getElementById('filterCampaign')?.value || '';
   const platform = document.getElementById('filterPlatform')?.value || '';
   const rows = allData.filter(r => r.year === year && (!month || r.month === month) &&
+    (!objective || getCampaignObjective(r.campaign) === objective) &&
     (!campaign || r.campaign === campaign) && (!platform || r.platform === platform));
   if (!rows.length) return {
     short: 'ยังไม่มีข้อมูลสำหรับตัวกรองที่เลือก',
@@ -874,7 +1100,7 @@ function wowTableCell(metric, text, currentRows, previousRows) {
   return `<div class="wow-table-cell"><span>${text}</span>${wowInline(metric, currentRows, previousRows)}</div>`;
 }
 function wowHeadline() {
-  if (!wowPeriod) return `<div class="wow-headline"><strong>WoW: ต้องการข้อมูลแยกตามวัน</strong><span>${getWoWDiagnostic().detail}</span></div>`;
+  if (!wowPeriod) return `<div class="wow-headline"><strong>WoW: ยังไม่มีข้อมูลครบสองสัปดาห์สำหรับเปรียบเทียบ</strong><span>${getWoWDiagnostic().detail}</span></div>`;
   const comparison = wowPeriod.previousCount > 0 ?
     `WoW: ${weekLabel(wowPeriod.current)} เทียบ ${weekLabel(wowPeriod.previous)}` :
     `ยังไม่มีข้อมูลสัปดาห์ก่อนหน้า (${weekLabel(wowPeriod.previous)})`;
@@ -943,6 +1169,10 @@ window.renderKPIs = function() {
   const fbWoW = key => wowCard(key, fbComparisonScope.current, fbComparisonScope.previous);
 
   let html = wowHeadline();
+  const objectiveLabel = {lead_gen:'Leads Gen', message:'Message', awareness:'Awareness'}[document.getElementById('filterObjective')?.value || ''];
+  if (objectiveLabel) {
+    html += `<div class="wow-headline" style="margin-top:8px"><strong>Objective: ${objectiveLabel}</strong><span>แสดงเฉพาะ Campaign ที่มี Objective ${objectiveLabel} ตามชื่อ Campaign รวมถึง KPI, WoW และตารางทั้งหมด</span></div>`;
+  }
 
   html += `
     <div class="kpi-section-title">Overview</div>
@@ -995,11 +1225,12 @@ window.renderKPIs = function() {
   // --- เริ่มต้นส่วน Facebook Content Performance Gallery ---
   const fbAdGroups = {};
   specificFbData.forEach(r => {
-    if (!fbAdGroups[r.ad]) fbAdGroups[r.ad] = { ad: r.ad, spend: 0, reach: 0, impressions: 0, message: 0 };
-    fbAdGroups[r.ad].spend += r.spend;
-    fbAdGroups[r.ad].reach += r.reach;
-    fbAdGroups[r.ad].impressions += r.impressions;
-    fbAdGroups[r.ad].message += r.message;
+    const adKey = JSON.stringify([r.platform, r.campaign, r.ad]);
+    if (!fbAdGroups[adKey]) fbAdGroups[adKey] = { ad: r.ad, campaign: r.campaign, spend: 0, reach: 0, impressions: 0, message: 0 };
+    fbAdGroups[adKey].spend += r.spend;
+    fbAdGroups[adKey].reach += r.reach;
+    fbAdGroups[adKey].impressions += r.impressions;
+    fbAdGroups[adKey].message += r.message;
   });
   
   // จัดเรียงตามค่าที่เลือกใน Dropdown และแสดง Top 10
@@ -1029,6 +1260,7 @@ window.renderKPIs = function() {
           <option value="message" ${currentFbGallerySort === 'message' ? 'selected' : ''}>Message สูงสุด</option>
         </select>
       </div>
+      ${imageControlsHTML()}
       <div class="carousel-wrapper">
         <button class="carousel-btn prev-btn" onclick="window.scrollFbGallery(-1)">
           <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
@@ -1042,10 +1274,12 @@ window.renderKPIs = function() {
      topFbAds.forEach((ad, index) => {
        let cpm = ad.impressions > 0 ? (ad.spend/ad.impressions)*1000 : 0;
        let cpmsg = ad.message > 0 ? ad.spend/ad.message : 0;
-       const adRows = getWoWData(getWowScopeRows().filter(r => r.platform === 'Facebook' && r.ad === ad.ad && (!currentFbCampaignFilter || r.campaign === currentFbCampaignFilter)));
-       let jpgPath = `./data/facebook/image/${ad.ad}.jpg`;
-       let pngPath = `./data/facebook/image/${ad.ad}.png`;
-       let displayPath = `./data/facebook/image/${ad.ad}.[jpg/png]`;
+       const adRows = getWoWData(getWowScopeRows().filter(r => r.platform === 'Facebook' && r.campaign === ad.campaign && r.ad === ad.ad && (!currentFbCampaignFilter || r.campaign === currentFbCampaignFilter)));
+       const match = resolveImageForAd(ad);
+       const filenameBase = GALLERY_IMG_DIR + encodeURIComponent(ad.ad);
+       const imgUrl = match?.url || filenameBase + '.jpg';
+       const displayPath = match?.name || `${ad.ad}.[jpg/png/jpeg/webp]`;
+       const imageLabel = match?.matchType || (match?.ambiguous ? 'ชื่อกำกวม — โปรดเลือกภาพ' : 'ค้นหาจาก Ads Name');
        
        html += `
        <div style="min-width:280px; max-width:280px; background:var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden; scroll-snap-align: start; display:flex; flex-direction:column; box-shadow:var(--shadow-sm);">
@@ -1055,14 +1289,16 @@ window.renderKPIs = function() {
              <!-- Placeholder with Monospace Path (Shown if image fails) -->
              <div style="position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:12px; text-align:center; z-index:1;">
                 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.5; margin-bottom:8px;"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-                <div style="font-family: monospace; font-size: 11px; color: var(--muted); word-break: break-all; background: var(--bg); padding: 4px 8px; border-radius: 4px; border: 1px dashed var(--border);">${displayPath}</div>
+                <div style="font-family: monospace; font-size: 11px; color: var(--muted); word-break: break-all; background: var(--bg); padding: 4px 8px; border-radius: 4px; border: 1px dashed var(--border);">${escapeImageHTML(displayPath)}</div>
              </div>
              
              <!-- Actual Image with Fallback Logic -->
-             <img src="${jpgPath}" alt="${ad.ad}" style="width:100%; height:100%; object-fit:cover; position:relative; z-index:2;" onerror="if(!this.dataset.triedPng){this.dataset.triedPng='1'; this.src='${pngPath}';}else{this.style.display='none';}">
+             <img src="${escapeImageHTML(imgUrl)}" alt="${escapeImageHTML(ad.ad)}" data-fallback-base="${escapeImageHTML(filenameBase)}" data-fallback-index="${match?.url ? 0 : 1}" style="width:100%; height:100%; object-fit:cover; position:relative; z-index:2;" onerror="window.onGalleryImageError(this)">
           </div>
           <div style="padding:16px; flex:1; display:flex; flex-direction:column;">
-             <div style="font-size:14px; font-weight:700; color:var(--text); line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;" title="${ad.ad}">${ad.ad}</div>
+             <div style="font-size:14px; font-weight:700; color:var(--text); line-height:1.4; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;" title="${escapeImageHTML(ad.ad)}">${escapeImageHTML(ad.ad)}</div>
+             <div class="image-match-label">${escapeImageHTML(imageLabel)}</div>
+             ${imagePickerHTML(ad, match)}
              
              <div style="margin-top:auto;">
                  <hr style="border:none; border-top:1px solid var(--border); margin: 16px 0 12px 0;" />
@@ -1112,18 +1348,26 @@ window.renderKPIs = function() {
   // --- สิ้นสุดส่วน Facebook Content Performance Gallery ---
 
   document.getElementById('kpiSection').innerHTML = html;
+  renderImageFilePanel();
 }
 
 window.renderTopAdsMetrics = function() {
   const d = filteredData;
   const adMetricGroups = {};
-  d.forEach(r => { if (r.ad) adMetricGroups[r.ad] = (adMetricGroups[r.ad] || 0) + r.reach; });
-  const sortedAdMetric = Object.entries(adMetricGroups).sort((a,b)=>b[1]-a[1]);
+  d.forEach(r => {
+    if (!r.ad) return;
+    const key = JSON.stringify([r.platform, r.campaign, r.ad]);
+    if (!adMetricGroups[key]) adMetricGroups[key] = {ad:r.ad, campaign:r.campaign, platform:r.platform, reach:0};
+    adMetricGroups[key].reach += r.reach;
+  });
+  const sortedAdMetric = Object.values(adMetricGroups).sort((a,b)=>b.reach-a.reach);
   const container = document.getElementById('topAdMetricsContainer');
   if (!sortedAdMetric.length) { container.innerHTML = ''; return; }
-  const adName = sortedAdMetric[0][0];
-  const totals = metricSummary(d.filter(r => r.ad === adName));
-  const dataWoW = getWoWData(getWowScopeRows().filter(r => r.ad === adName));
+  const top = sortedAdMetric[0];
+  const adName = top.ad;
+  const sameAd = r => r.ad === top.ad && r.campaign === top.campaign && r.platform === top.platform;
+  const totals = metricSummary(d.filter(sameAd));
+  const dataWoW = getWoWData(getWowScopeRows().filter(sameAd));
   const item = (label, metric, value) => `<div class="top-metric-item"><div class="tm-label">${label}</div><div class="tm-val">${value}</div>${wowInline(metric, dataWoW.current, dataWoW.previous, 'tm-wow')}</div>`;
   container.innerHTML = `
     <div class="top-metric-item"><div class="tm-label">Ad Name</div><div class="tm-val" style="font-size:13px;word-break:break-all;color:var(--primary);">${escapeHtml(adName)}</div></div>
@@ -1152,12 +1396,13 @@ window.handleSort = function(col) {
 window.renderTable = function() {
   const groupedObj = {};
   filteredData.forEach(r => {
-    if (!groupedObj[r.ad]) groupedObj[r.ad] = { ad: r.ad, platform: r.platform, spend: 0, reach: 0, impressions: 0, message: 0, leads: 0, clicks: 0, hasClicks: false };
-    groupedObj[r.ad].spend += r.spend; groupedObj[r.ad].reach += r.reach; 
-    groupedObj[r.ad].impressions += r.impressions; groupedObj[r.ad].message += r.message; 
-    groupedObj[r.ad].leads += r.leads;
+    const adKey = JSON.stringify([r.platform, r.campaign, r.ad]);
+    if (!groupedObj[adKey]) groupedObj[adKey] = { ad: r.ad, campaign: r.campaign, platform: r.platform, spend: 0, reach: 0, impressions: 0, message: 0, leads: 0, clicks: 0, hasClicks: false };
+    groupedObj[adKey].spend += r.spend; groupedObj[adKey].reach += r.reach;
+    groupedObj[adKey].impressions += r.impressions; groupedObj[adKey].message += r.message;
+    groupedObj[adKey].leads += r.leads;
     if (r.clicks !== null && r.clicks !== undefined) {
-      groupedObj[r.ad].clicks += r.clicks; groupedObj[r.ad].hasClicks = true;
+      groupedObj[adKey].clicks += r.clicks; groupedObj[adKey].hasClicks = true;
     }
   });
 
@@ -1181,7 +1426,7 @@ window.renderTable = function() {
   document.getElementById('tableCount').textContent = `แสดง ${groupedData.length} รายการ`;
   const adWeeklyRows = getWowScopeRows();
   document.getElementById('tableBody').innerHTML = groupedData.map(r=>{
-    const w = getWoWData(adWeeklyRows.filter(row => row.ad === r.ad && row.platform === r.platform));
+    const w = getWoWData(adWeeklyRows.filter(row => row.ad === r.ad && row.campaign === r.campaign && row.platform === r.platform));
     const pColor = r.platform === 'Facebook' ? '#1877F2' : '#EA4335';
     return `<tr>
       <td title="${r.ad}" style="max-width:240px; overflow:hidden; text-overflow:ellipsis;"><span>${r.ad}</span></td>
@@ -1277,5 +1522,6 @@ window.scrollFbGallery = function(direction) {
   }
 };
 </script>
+<input id="imageFolderInput" type="file" accept="image/*" multiple webkitdirectory directory style="display:none" onchange="window.readImageFolder(this)" aria-label="เลือกโฟลเดอร์ไฟล์โฆษณา">
 </body>
 </html>
